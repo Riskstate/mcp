@@ -1,11 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import {
+  checkTrade,
+  getMarketStructure,
+  getPlaybookStatus,
+  getRiskPolicy,
+  type Deps,
+} from "./handlers.js";
 
-// We test the tool handler logic by extracting the core behavior.
-// Since the MCP SDK wires tools internally, we test the fetch + response logic directly.
+// These tests exercise the REAL handlers from ./handlers.ts. They used to run
+// against a copy of the handler pasted into this file, which could (and did)
+// drift from the shipped code.
 
 const API_BASE = "https://api.riskstate.ai";
 
-// Mock response factory
 function mockResponse(status: number, body: unknown): Response {
   return {
     ok: status >= 200 && status < 300,
@@ -27,108 +34,18 @@ function mockResponse(status: number, body: unknown): Response {
   } as Response;
 }
 
-// Extracted handler logic (mirrors src/index.ts tool handler)
-async function handleGetRiskPolicy(
-  input: {
-    asset: string;
-    wallet_address?: string;
-    protocol?: string;
-    include_details?: boolean;
-  },
+const deps = (apiKey: string | undefined, fetchFn: typeof fetch): Deps => ({
+  apiBase: API_BASE,
+  apiKey,
+  fetchFn,
+});
+
+/** Back-compat shim so the existing get_risk_policy suite reads unchanged. */
+const handleGetRiskPolicy = (
+  input: { asset: string; wallet_address?: string; protocol?: string; include_details?: boolean },
   apiKey: string | undefined,
-  fetchFn: typeof fetch
-) {
-  if (!apiKey) {
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: "Error: RISKSTATE_API_KEY environment variable is required. Get a free API key at https://riskstate.ai",
-        },
-      ],
-      isError: true,
-    };
-  }
-
-  const body: Record<string, unknown> = { asset: input.asset };
-  if (input.wallet_address) body.wallet_address = input.wallet_address;
-  if (input.protocol) body.protocol = input.protocol;
-  if (input.include_details) body.include_details = input.include_details;
-
-  try {
-    const response = await fetchFn(`${API_BASE}/v1/risk-state`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30000),
-    });
-
-    if (!response.ok) {
-      const status = response.status;
-      const errorText = await response.text().catch(() => "");
-
-      let message: string;
-      if (status === 401) {
-        message =
-          "Authentication failed. Check your RISKSTATE_API_KEY is valid.";
-      } else if (status === 429) {
-        message =
-          "Rate limited. Wait 60 seconds before retrying. Limit: 60 requests/minute.";
-      } else if (status === 400) {
-        message = `Bad request: ${errorText || "check parameters"}`;
-      } else if (status >= 500) {
-        message = `Server error (${status}). Retry in 30 seconds.`;
-      } else {
-        message = `HTTP ${status}: ${errorText || "Unknown error"}`;
-      }
-
-      return {
-        content: [{ type: "text" as const, text: message }],
-        isError: true,
-      };
-    }
-
-    const data = await response.json();
-    const policy = data.exposure_policy || {};
-    const maxSizePct = policy.max_size_fraction != null
-      ? (policy.max_size_fraction * 100).toFixed(1)
-      : "?";
-
-    const summary = [
-      `POLICY: Level ${data.policy_level ?? "?"} | ${data.structural_state ?? "?"}`,
-      `MAX SIZE: ${maxSizePct}%`,
-      `LEVERAGE: ${policy.max_leverage ?? "?"}`,
-      `BLOCKED: ${(policy.blocked_actions || []).join(", ") || "none"}`,
-      `REGIME: ${data.market_regime || "?"} | VOLATILITY: ${data.volatility_regime || "?"}`,
-      `CONFIDENCE: ${data.confidence_score ?? "?"} | DATA QUALITY: ${data.data_quality_score ?? "?"}%`,
-      `BINDING: ${data.binding_constraint?.source ?? "?"} (${data.binding_constraint?.reason ?? "?"})`,
-      `TTL: ${data.ttl_seconds ?? 60}s`,
-    ].join("\n");
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: summary + "\n\n" + JSON.stringify(data, null, 2),
-        },
-      ],
-    };
-  } catch (err) {
-    const message =
-      err instanceof Error
-        ? err.name === "TimeoutError" || err.name === "AbortError"
-          ? "Request timed out after 30s. The API may be under heavy load — retry in 30s."
-          : `Network error: ${err.message}`
-        : "Unknown error";
-    return {
-      content: [{ type: "text" as const, text: message }],
-      isError: true,
-    };
-  }
-}
+  fetchFn: typeof fetch,
+) => getRiskPolicy(input, deps(apiKey, fetchFn));
 
 describe("get_risk_policy", () => {
   beforeEach(() => {
@@ -324,5 +241,152 @@ describe("get_risk_policy", () => {
 
     expect(result.content[0].text).toContain("BLOCKED: NEW_TRADES, LEVERAGE_GT_2X");
     expect(result.content[0].text).toContain("REGIME: PANIC | VOLATILITY: EXTREME");
+  });
+});
+
+describe("get_market_structure", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("requires an API key", async () => {
+    const r = await getMarketStructure({ asset: "BTC" }, deps(undefined, vi.fn()));
+    expect(r.isError).toBe(true);
+    expect(r.content[0].text).toContain("RISKSTATE_API_KEY");
+  });
+
+  it("summarises headline, triggers, events and friction", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      mockResponse(200, {
+        asset: "BTC",
+        headline: "BUYABLE FEAR",
+        subhead: "Fear dislocation, regime gate clear",
+        watch: { breakout: 71200, breakdown: 58400 },
+        asymmetry: { label: "POSITIVE" },
+        events: [
+          { event: "Extreme Fear Reversal", direction: "bullish", status: "confirmed", validated: true },
+          { event: "Breakout Continuation", direction: "bullish", status: "forming", validated: false },
+          { event: "Old Thing", status: "suppressed" },
+        ],
+        friction_levels: { summary: "2 walls to the 40d-high trigger" },
+        structure_version: "structure_v0.7",
+        state_hash: "abc123",
+      }),
+    );
+    const r = await getMarketStructure({ asset: "BTC" }, deps("k", fetchFn));
+
+    expect(r.isError).toBeUndefined();
+    const t = r.content[0].text;
+    expect(t).toContain("STRUCTURE BTC: BUYABLE FEAR");
+    expect(t).toContain("ASYMMETRY: POSITIVE");
+    expect(t).toContain("breakout 71200");
+    expect(t).toContain("EVENTS (2 active)");     // suppressed one excluded
+    expect(t).toContain("accruing");               // validated:false surfaced
+    expect(t).toContain("FRICTION: 2 walls");
+  });
+
+  it("omits the friction line on an older response", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(mockResponse(200, { asset: "ETH", events: [] }));
+    const r = await getMarketStructure({ asset: "ETH" }, deps("k", fetchFn));
+    expect(r.content[0].text).not.toContain("FRICTION:");
+  });
+});
+
+describe("get_playbook_status", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  const feed = {
+    schema: "playbook_view_v2",
+    count: 10,
+    firing: {
+      BTC: [
+        { playbook_id: "pb-fires", would_fire: true, suppressed: false, structure_blocked: false, fire_blocked_by: null, gate_status: "ALLOW" },
+        { playbook_id: "pb-cooling", would_fire: true, suppressed: false, structure_blocked: false, fire_blocked_by: "cooldown", gate_status: "ALLOW" },
+        { playbook_id: "pb-vetoed", would_fire: true, suppressed: false, structure_blocked: true, fire_blocked_by: null, gate_status: "BLOCK" },
+      ],
+      ETH: [],
+    },
+  };
+
+  it("works WITHOUT an API key (public endpoint)", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(mockResponse(200, feed));
+    const r = await getPlaybookStatus({}, deps(undefined, fetchFn));
+    expect(r.isError).toBeUndefined();
+    expect(fetchFn).toHaveBeenCalledOnce();
+    const [, init] = fetchFn.mock.calls[0];
+    expect(init.headers.Authorization).toBeUndefined();
+  });
+
+  it("does not report a cooldown-locked setup as actionable", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(mockResponse(200, feed));
+    const r = await getPlaybookStatus({ asset: "BTC" }, deps(undefined, fetchFn));
+    const t = r.content[0].text;
+    expect(t).toContain("BTC: 1 actionable");
+    expect(t).toContain("pb-fires");
+    expect(t).not.toContain("pb-cooling (gate");        // not in the actionable list
+    expect(t).toContain("1 matching but in cooldown");  // but still surfaced
+    expect(t).not.toContain("pb-vetoed (gate");         // structure-blocked excluded
+  });
+
+  it("covers both assets when none is given", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(mockResponse(200, feed));
+    const r = await getPlaybookStatus({}, deps(undefined, fetchFn));
+    expect(r.content[0].text).toContain("BTC:");
+    expect(r.content[0].text).toContain("ETH: 0 actionable");
+  });
+});
+
+describe("check_trade", () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  it("requires an API key", async () => {
+    const r = await checkTrade(
+      { positions: [{ asset: "BTC", size_usd: 1000, side: "long" }] },
+      deps(undefined, vi.fn()),
+    );
+    expect(r.isError).toBe(true);
+  });
+
+  it("reports per-position verdicts and keeps advisories separate from blockers", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(
+      mockResponse(200, {
+        portfolio: { portfolio_allowed: false, gross_exposure_usd: 330000, net_exposure_usd: 330000 },
+        positions: [
+          { index: 0, asset: "BTC", side: "long", size_usd: 250000, allowed: false,
+            policy_level: 4, max_size_fraction: 0.42, max_size_usd: 138600,
+            reason_codes: ["POSITION_OVER_MAX_SIZE"], advisories: ["ALL_IN_BLOCKED_BY_ENGINE"] },
+          { index: 1, asset: "ETH", side: "long", size_usd: 80000, allowed: true,
+            policy_level: 4, max_size_fraction: 0.48, max_size_usd: 158400,
+            reason_codes: [], advisories: [] },
+        ],
+      }),
+    );
+    const r = await checkTrade(
+      { positions: [
+        { asset: "BTC", size_usd: 250000, side: "long" },
+        { asset: "ETH", size_usd: 80000, side: "long" },
+      ] },
+      deps("k", fetchFn),
+    );
+
+    const t = r.content[0].text;
+    expect(t).toContain("PORTFOLIO: NOT ALLOWED");
+    expect(t).toContain("[0] BTC long 250000 → BLOCKED");
+    expect(t).toContain("cap 42.0%");
+    expect(t).toContain("blocked_by: POSITION_OVER_MAX_SIZE");
+    expect(t).toContain("note: ALL_IN_BLOCKED_BY_ENGINE");
+    expect(t).toContain("[1] ETH long 80000 → ALLOWED");
+    expect(t).toContain("pre-trade assessment, not an order");
+  });
+
+  it("sends the positions array to /v2/portfolio-risk-state", async () => {
+    const fetchFn = vi.fn().mockResolvedValue(mockResponse(200, { portfolio: {}, positions: [] }));
+    await checkTrade(
+      { positions: [{ asset: "BTC", size_usd: 500, side: "short", venue_type: "perp" }] },
+      deps("k", fetchFn),
+    );
+    const [url, init] = fetchFn.mock.calls[0];
+    expect(url).toContain("/v2/portfolio-risk-state");
+    expect(JSON.parse(init.body)).toEqual({
+      positions: [{ asset: "BTC", size_usd: 500, side: "short", venue_type: "perp" }],
+    });
   });
 });
